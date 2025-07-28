@@ -1,7 +1,3 @@
-# KneeXNet-2.5D: A Clinically-Oriented and  Explainable Deep Learning Framework for MRI-Based Knee Cartilage and Meniscus Segmentation
-# KneeXNet-2.5D: an AI Tool set for Knee Cartilage and Meniscus Segmentation in MRIs
-
-
 import cv2
 import numpy as np
 import segmentation_models_pytorch as smp
@@ -41,11 +37,16 @@ def load_model(model_path):
 
 def preprocess_np_slice(img: np.ndarray, size: int):
     """Convert grayscale np.array to resized torch tensor"""
-    pil_img = Image.fromarray(img.astype(np.uint8))
+    if img.dtype != np.uint8:
+        img = np.clip(img, 0, 1)  # If already in [0, 1]
+        img = (img * 255).astype(np.uint8)
+
+    pil_img = Image.fromarray(img)
     transform = transforms.Compose(
         [
             transforms.Resize((size, size)),
-            transforms.ToTensor(),  # assumes grayscale image
+            # transforms.Grayscale(num_output_channels=1),
+            transforms.ToTensor(),
         ]
     )
     return transform(pil_img).squeeze(0)  # type: ignore
@@ -97,19 +98,8 @@ def entropy_map(prob_tensor):
     return entropy.cpu().numpy()
 
 
-def _overlay_entropy(entropy, image_gray):
-    entropy_norm = cv2.normalize(entropy, None, 0, 255, cv2.NORM_MINMAX).astype(
-        np.uint8
-    )
-    entropy_color = cv2.applyColorMap(entropy_norm, cv2.COLORMAP_JET)
-    image_gray = (image_gray * 255).astype(np.uint8)
-    image_color = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2BGR)
-    overlay = cv2.addWeighted(image_color, 0.6, entropy_color, 0.4, 0)
-    return overlay
-
-
 def overlay_entropy(entropy, image_gray):
-    entropy_norm = cv2.normalize(entropy, None, 0, 255, cv2.NORM_MINMAX).astype(
+    entropy_norm = cv2.normalize(entropy, None, 0, 255, cv2.NORM_MINMAX).astype(  # type: ignore
         np.uint8
     )
     entropy_color = cv2.applyColorMap(entropy_norm, cv2.COLORMAP_JET)
@@ -129,10 +119,10 @@ def visualize_segmentation(segmentation):
     colors = np.array(
         [
             [0, 0, 0],
-            [255, 0, 0],
             [0, 255, 0],
             [0, 0, 255],
-            [255, 255, 0],
+            [255, 165, 0],  # ffa500
+            [116, 20, 12],  # 74140c
         ],
         dtype=np.uint8,
     )
@@ -146,86 +136,132 @@ def load_models():
     return models_256, models_512
 
 
-col_logo, col_qr_code = st.columns([1, 1])
+def main():
+    st.set_page_config(layout="wide")
 
+    col_logo, _, col_qr_code = st.columns([1, 5, 1])
 
-with col_logo:
-    st.image("https://pitthexai.github.io/assets/img/Pitthexai_logo.png", width=300)
+    with col_logo:
+        st.image("https://pitthexai.github.io/assets/img/Pitthexai_logo.png", width=300)
 
-with col_qr_code:
-    st.image("https://pitthexai.github.io/images/qr-code.png", width=120)
+    with col_qr_code:
+        st.image("https://pitthexai.github.io/images/qr-code.png", width=120)
 
-st.title(
-    "KneeXNet-2.5D: an AI Tool set for Knee Cartilage and Meniscus Segmentation in MRIs"
-)
+    st.title(
+        "KneeXNet-2.5D: an AI Tool set for Knee Cartilage and Meniscus Segmentation in MRIs"
+    )
 
+    st.markdown("""
+    Upload a `.npy` file that contains a stack of MRI slices.
 
-st.markdown("""
-Upload a `.npy` file that contains a stack of MRI slices.
+    You can scroll through the slices and see:
+    - Original grayscale slice
+    - Segmentation map
+    - Entropy-based uncertainty overlay
+    """)
 
-You can scroll through the slices and see:
-- Original grayscale slice
-- Segmentation map
-- Entropy-based uncertainty overlay
-""")
+    uploaded_npy = st.file_uploader(
+        "Upload .npy file containing MRI slices", type=["npy"]
+    )
 
-uploaded_npy = st.file_uploader("Upload .npy file containing MRI slices", type=["npy"])
+    if uploaded_npy:
+        try:
+            slices_np = np.load(uploaded_npy)  # shape: [N, H, W]
 
-if uploaded_npy:
-    try:
-        slices_np = np.load(uploaded_npy)  # shape: [N, H, W]
-        if slices_np.ndim != 3 or slices_np.shape[0] < 3:
-            st.error(
-                "Uploaded file must be 3D array: [N_slices, H, W] and have at least 3 slices."
-            )
-            st.stop()
+            if slices_np.ndim != 3 or slices_np.shape[0] < 3:
+                st.error(
+                    "Uploaded file must be 3D array: [N_slices, H, W] and have at least 3 slices."
+                )
+                st.stop()
 
-        num_slices = slices_np.shape[0]
-        st.success(f"Loaded volume with {num_slices} slices")
+            num_slices = slices_np.shape[0]
+            st.success(f"Loaded volume with {num_slices} slices")
 
-        idx = (
-            1
-            if num_slices == 3
-            else st.slider("Select central slice", 1, num_slices - 2, step=1)
-        )
-
-        with st.spinner("Loading models..."):
-            models_256, models_512 = load_models()
-
-        input_256 = stack_three_np_slices(slices_np, idx, 256)
-        input_512 = stack_three_np_slices(slices_np, idx, 512)
-
-        with st.spinner("Running segmentation..."):
-            probs_256 = run_inference(models_256, input_256, resize_to=512)
-            probs_512 = run_inference(models_512, input_512, resize_to=None)
-
-            fused_prob = fuse_probs(probs_256, probs_512)
-            segmentation = torch.argmax(fused_prob, dim=0).cpu().numpy()
-
-        mean_slice = slices_np[idx] / 255.0
-        entropy = entropy_map(fused_prob)
-        entropy_overlay = overlay_entropy(entropy, mean_slice)
-        seg_vis = visualize_segmentation(segmentation)
-
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-            st.image(
-                mean_slice,
-                caption=f"Grayscale Slice {idx}",
-                clamp=True,
-                use_container_width=True,
+            idx = (
+                1
+                if num_slices == 3
+                else st.slider("Select central slice", 1, num_slices - 2, step=1)
             )
 
-        with col2:
-            st.image(seg_vis, caption="Segmentation Map", use_container_width=True)
+            with st.spinner("Loading models..."):
+                models_256, models_512 = load_models()
 
-        with col3:
-            st.image(
-                entropy_overlay, caption="Entropy Overlay", use_container_width=True
-            )
+            input_256 = stack_three_np_slices(slices_np, idx, 256)
+            input_512 = stack_three_np_slices(slices_np, idx, 512)
 
-    except Exception as e:
-        st.error(f"Failed to process uploaded file: {e}")
-else:
-    st.info("Please upload a .npy volume to begin.")
+            with st.spinner("Running segmentation..."):
+                probs_256 = run_inference(models_256, input_256, resize_to=512)
+                probs_512 = run_inference(models_512, input_512, resize_to=None)
+
+                fused_prob = fuse_probs(probs_256, probs_512)
+                segmentation = torch.argmax(fused_prob, dim=0).cpu().numpy()
+
+            mean_slice = slices_np[idx]
+            entropy = entropy_map(fused_prob)
+            entropy_overlay = overlay_entropy(entropy, mean_slice)
+            seg_vis = visualize_segmentation(segmentation)
+
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                st.image(
+                    mean_slice,
+                    caption=f"Grayscale Slice {idx}",
+                    clamp=True,
+                    use_container_width=True,
+                )
+
+            with col2:
+                st.image(seg_vis, caption="Segmentation Map", use_container_width=True)
+
+            with col3:
+                st.image(
+                    entropy_overlay, caption="Entropy Overlay", use_container_width=True
+                )
+
+            cols = st.columns(4)
+
+            with cols[0]:
+                st.markdown(
+                    '<div style="display:flex;align-items:center;">'
+                    '<div style="background-color:#00FF00;width:20px;height:10px;margin-right:8px;"></div>'
+                    "<strong>Distal femoral cartilage</strong>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            with cols[1]:
+                st.markdown(
+                    '<div style="display:flex;align-items:center;">'
+                    '<div style="background-color:#3399FF;width:20px;height:10px;margin-right:8px;"></div>'
+                    "<strong>Proximal tibial cartilage</strong>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            with cols[2]:
+                st.markdown(
+                    '<div style="display:flex;align-items:center;">'
+                    '<div style="background-color:#FFB300;width:20px;height:10px;margin-right:8px;"></div>'
+                    "<strong>Patellar cartilage</strong>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            with cols[3]:
+                st.markdown(
+                    '<div style="display:flex;align-items:center;">'
+                    '<div style="background-color:#5D1000;width:20px;height:10px;margin-right:8px;"></div>'
+                    "<strong>Meniscus</strong>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+
+        except Exception as e:
+            st.error(f"Failed to process uploaded file: {e}")
+    else:
+        st.info("Please upload a .npy volume to begin.")
+
+
+if __name__ == "__main__":
+    main()
