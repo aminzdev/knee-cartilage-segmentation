@@ -1,3 +1,4 @@
+import logging
 import cv2
 import numpy as np
 import segmentation_models_pytorch as smp
@@ -6,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
+from ultralytics import YOLO
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -21,6 +23,15 @@ MODEL_512_PATHS = [
 
 NUM_CLASSES = 5
 
+logger = logging.getLogger("App")
+logger.setLevel(logging.DEBUG)
+handler = logging.StreamHandler()
+handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter("%(name)s - %(levelname)s - %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logging.getLogger().setLevel(logging.WARNING)
+
 
 def load_model(model_path):
     model = smp.Unet(
@@ -35,28 +46,74 @@ def load_model(model_path):
     return model
 
 
+def save_npy_image(image: np.ndarray, path: str):
+    if image.dtype == np.float32 or image.dtype == np.float64:
+        image = (image * 255).astype(np.uint8)
+
+    img = Image.fromarray(image)
+
+    img.save(path)
+
+
+def localize(
+    image: np.ndarray, model: YOLO
+) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+    # image = cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)  # type: ignore
+    image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    results = model.predict(image, verbose=False)[0]
+
+    if not results.boxes or len(results.boxes) == 0:
+        return None  # No detection
+
+    boxes = results.boxes.xyxy.cpu().numpy().astype(int)  # type: ignore
+    scores = results.boxes.conf.cpu().numpy()  # type: ignore
+
+    best_idx = np.argmax(scores)
+    x1, y1, x2, y2 = boxes[best_idx]
+
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    best_crop = image[y1:y2, x1:x2]
+    # crops = [image[y1:y2, x1:x2] for x1, y1, x2, y2 in boxes]
+
+    return best_crop, (x1, y1, x2, y2)
+
+
 def preprocess_np_slice(img: np.ndarray, size: int):
     """Convert grayscale np.array to resized torch tensor"""
     if img.dtype != np.uint8:
-        img = np.clip(img, 0, 1)  # If already in [0, 1]
+        img = np.clip(img, 0, 1)
         img = (img * 255).astype(np.uint8)
 
     pil_img = Image.fromarray(img)
     transform = transforms.Compose(
         [
             transforms.Resize((size, size)),
-            # transforms.Grayscale(num_output_channels=1),
             transforms.ToTensor(),
         ]
     )
     return transform(pil_img).squeeze(0)  # type: ignore
 
 
-def stack_three_np_slices(np_slices, index, size):
+def stack_three_np_slices(np_slices, index, size, model):
     """Get 3 adjacent slices and stack as 3-channel tensor"""
+    slices = [np_slices[i] for i in [index - 1, index, index + 1]]
+
+    localized_slices = []
+
+    for slice in slices:
+        res = localize(slice, model)
+
+        if res is None:
+            return torch.zeros((1, 3, size, size)).to(DEVICE)
+
+        crop, _ = res
+        localized_slices.append(crop)
+
     slices = [
-        preprocess_np_slice(np_slices[i], size) for i in [index - 1, index, index + 1]
+        preprocess_np_slice(localized_slice, size)
+        for localized_slice in localized_slices
     ]
+
     stacked = torch.stack(slices, dim=0)  # [3, H, W]
     return stacked.unsqueeze(0).to(DEVICE)  # [1,3,H,W]
 
@@ -131,9 +188,10 @@ def visualize_segmentation(segmentation):
 
 @st.cache_resource(show_spinner=False)
 def load_models():
+    yolo_model = YOLO("./models/yolo.pt")
     models_256 = [load_model(p) for p in MODEL_256_PATHS]
     models_512 = [load_model(p) for p in MODEL_512_PATHS]
-    return models_256, models_512
+    return yolo_model, models_256, models_512
 
 
 def main():
@@ -160,107 +218,133 @@ def main():
     - Entropy-based uncertainty overlay
     """)
 
+    with st.spinner("Loading models..."):
+        yolo_model, models_256, models_512 = load_models()
+
     uploaded_npy = st.file_uploader(
         "Upload .npy file containing MRI slices", type=["npy"]
     )
 
-    if uploaded_npy:
-        try:
-            slices_np = np.load(uploaded_npy)  # shape: [N, H, W]
+    if not uploaded_npy:
+        st.info("Please upload a .npy volume to begin.")
+        return
 
-            if slices_np.ndim != 3 or slices_np.shape[0] < 3:
-                st.error(
-                    "Uploaded file must be 3D array: [N_slices, H, W] and have at least 3 slices."
-                )
-                st.stop()
+    try:
+        slices_np = np.load(uploaded_npy)  # shape: [N, H, W]
 
-            num_slices = slices_np.shape[0]
-            st.success(f"Loaded volume with {num_slices} slices")
+        if slices_np.ndim != 3 or slices_np.shape[0] < 3:
+            st.error(
+                "Uploaded file must be 3D array: [N_slices, H, W] and have at least 3 slices."
+            )
+            st.stop()
 
-            idx = (
-                1
-                if num_slices == 3
-                else st.slider("Select central slice", 1, num_slices - 2, step=1)
+        num_slices = slices_np.shape[0]
+        st.success(f"Loaded volume with {num_slices} slices")
+
+        idx = (
+            1
+            if num_slices == 3
+            else st.slider("Select central slice", 1, num_slices - 2, step=1)
+        )
+
+        input_256 = stack_three_np_slices(slices_np, idx, 256, yolo_model)
+        input_512 = stack_three_np_slices(slices_np, idx, 512, yolo_model)
+
+        with st.spinner("Running segmentation..."):
+            probs_256 = run_inference(models_256, input_256, resize_to=512)
+            probs_512 = run_inference(models_512, input_512, resize_to=None)
+
+            fused_prob = fuse_probs(probs_256, probs_512)
+            segmentation = torch.argmax(fused_prob, dim=0).cpu().numpy()
+
+        mean_slice = slices_np[idx]
+        entropy = entropy_map(fused_prob)
+        seg_vis = visualize_segmentation(segmentation)
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        image = mean_slice
+        localized_image = np.zeros_like(image)
+
+        res = localize(mean_slice, yolo_model)
+
+        if res is not None:
+            _, bbox = res
+            x1, y1, x2, y2 = bbox
+
+            localized_image = image[y1:y2, x1:x2]
+            localized_image = cv2.resize(localized_image, (512, 512))
+
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+            cv2.rectangle(image, (x1, y1), (x2, y2), color=(255, 0, 0), thickness=2)
+
+            entropy_overlay = overlay_entropy(entropy, localized_image)
+        else:
+            entropy_overlay = overlay_entropy(entropy, mean_slice)
+
+        with col1:
+            st.image(
+                image,
+                caption=f"Grayscale Slice {idx}",
+                clamp=True,
+                use_container_width=True,
             )
 
-            with st.spinner("Loading models..."):
-                models_256, models_512 = load_models()
+        with col2:
+            st.image(
+                localized_image,
+                caption=f"Localized Slice {idx}",
+                use_container_width=True,
+            )
 
-            input_256 = stack_three_np_slices(slices_np, idx, 256)
-            input_512 = stack_three_np_slices(slices_np, idx, 512)
+        with col3:
+            st.image(seg_vis, caption="Segmentation Map", use_container_width=True)
 
-            with st.spinner("Running segmentation..."):
-                probs_256 = run_inference(models_256, input_256, resize_to=512)
-                probs_512 = run_inference(models_512, input_512, resize_to=None)
+        with col4:
+            st.image(
+                entropy_overlay, caption="Entropy Overlay", use_container_width=True
+            )
 
-                fused_prob = fuse_probs(probs_256, probs_512)
-                segmentation = torch.argmax(fused_prob, dim=0).cpu().numpy()
+        cols = st.columns(4)
 
-            mean_slice = slices_np[idx]
-            entropy = entropy_map(fused_prob)
-            entropy_overlay = overlay_entropy(entropy, mean_slice)
-            seg_vis = visualize_segmentation(segmentation)
+        with cols[0]:
+            st.markdown(
+                '<div style="display:flex;align-items:center;">'
+                '<div style="background-color:#00FF00;width:20px;height:10px;margin-right:8px;"></div>'
+                "<strong>Distal femoral cartilage</strong>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
-            col1, col2, col3 = st.columns(3)
+        with cols[1]:
+            st.markdown(
+                '<div style="display:flex;align-items:center;">'
+                '<div style="background-color:#3399FF;width:20px;height:10px;margin-right:8px;"></div>'
+                "<strong>Proximal tibial cartilage</strong>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
-            with col1:
-                st.image(
-                    mean_slice,
-                    caption=f"Grayscale Slice {idx}",
-                    clamp=True,
-                    use_container_width=True,
-                )
+        with cols[2]:
+            st.markdown(
+                '<div style="display:flex;align-items:center;">'
+                '<div style="background-color:#FFB300;width:20px;height:10px;margin-right:8px;"></div>'
+                "<strong>Patellar cartilage</strong>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
-            with col2:
-                st.image(seg_vis, caption="Segmentation Map", use_container_width=True)
+        with cols[3]:
+            st.markdown(
+                '<div style="display:flex;align-items:center;">'
+                '<div style="background-color:#5D1000;width:20px;height:10px;margin-right:8px;"></div>'
+                "<strong>Meniscus</strong>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
-            with col3:
-                st.image(
-                    entropy_overlay, caption="Entropy Overlay", use_container_width=True
-                )
-
-            cols = st.columns(4)
-
-            with cols[0]:
-                st.markdown(
-                    '<div style="display:flex;align-items:center;">'
-                    '<div style="background-color:#00FF00;width:20px;height:10px;margin-right:8px;"></div>'
-                    "<strong>Distal femoral cartilage</strong>"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
-
-            with cols[1]:
-                st.markdown(
-                    '<div style="display:flex;align-items:center;">'
-                    '<div style="background-color:#3399FF;width:20px;height:10px;margin-right:8px;"></div>'
-                    "<strong>Proximal tibial cartilage</strong>"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
-
-            with cols[2]:
-                st.markdown(
-                    '<div style="display:flex;align-items:center;">'
-                    '<div style="background-color:#FFB300;width:20px;height:10px;margin-right:8px;"></div>'
-                    "<strong>Patellar cartilage</strong>"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
-
-            with cols[3]:
-                st.markdown(
-                    '<div style="display:flex;align-items:center;">'
-                    '<div style="background-color:#5D1000;width:20px;height:10px;margin-right:8px;"></div>'
-                    "<strong>Meniscus</strong>"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
-
-        except Exception as e:
-            st.error(f"Failed to process uploaded file: {e}")
-    else:
-        st.info("Please upload a .npy volume to begin.")
+    except Exception as e:
+        st.error(f"Failed to process: {e}")
 
 
 if __name__ == "__main__":
