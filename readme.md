@@ -97,11 +97,12 @@ The app will launch in your browser at `http://localhost:8501`.
 ```
 .
 ├── app.py                   # Main Streamlit app
-├── models/
-│   ├── 256_model_1.pth
+├── models/                  # Directory for trained models (not included in repo)
+│   ├── 256_model_1.pth      # Contact maintainer for access
 │   ├── 256_model_2.pth
 │   ├── 512_model_1.pth
-│   └── 512_model_2.pth
+│   ├── 512_model_2.pth
+│   └── localizer.pth
 ├── readme.md
 └── requirements.txt
 ```
